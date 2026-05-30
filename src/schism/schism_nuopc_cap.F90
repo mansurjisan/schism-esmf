@@ -49,6 +49,23 @@ module schism_nuopc_cap
   private
   public SetServices
 
+#ifdef USE_NUOPC_RIVER
+  !> One-way NWM river forcing (USE_NUOPC_RIVER). Increment 1 injects a uniform
+  !> constant discharge [m^3/s] into every SCHISM source element (a stub) until
+  !> the per-element river import field is connected (Phase 5). Overridable via
+  !> the 'river_stub_q' component attribute in ufs.configure.
+  real(ESMF_KIND_R8), save :: river_stub_q = 100.0_ESMF_KIND_R8
+  !> When .true. (set from the 'nwm_coupling' component attribute) the river
+  !> import field 'river_volume_flux' is EXEMPTED from SCHISM_RemoveUnconnectedFields.
+  !> The SCHISM cap uses the legacy IPDv00 protocol, whose single realize phase
+  !> runs (and removes unconnected fields) BEFORE the direct NWM->OCN connector —
+  !> a CDEPS provider that completes its connection in a later transfer phase —
+  !> has connected the field. Removing it there drops it permanently. Keeping it
+  !> lets the connection complete so ModelAdvance reads real per-element discharge.
+  !> Left .false. for stub / no-NWM runs so they remain byte-identical to before.
+  logical, save :: keep_river_field = .false.
+#endif
+
 contains
 
 #undef ESMF_METHOD
@@ -341,6 +358,31 @@ subroutine InitializeAdvertise(comp, importState, exportState, clock, rc)
   write(message, '(A,I1)') trim(compName)//' debug_level is set to ', debug_level
   call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
 
+#ifdef USE_NUOPC_RIVER
+  ! one-way NWM river forcing: constant stub discharge [m^3/s] (Increment 1;
+  ! per-element values from the river import field replace this in Phase 5)
+  call NUOPC_CompAttributeGet(comp, name='river_stub_q', value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  if (isPresent .and. isSet) then
+     read(cvalue,*) river_stub_q
+  end if
+  write(message, '(A,F12.3)') trim(compName)//' river_stub_q [m^3/s] = ', river_stub_q
+  call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+
+  ! nwm_coupling=true: a dnwm NWM provider IS connected via a direct NWM->OCN
+  ! connector, so keep 'river_volume_flux' through SCHISM_RemoveUnconnectedFields
+  ! (see keep_river_field). Absent/false => stub path (field removed; constant q).
+  call NUOPC_CompAttributeGet(comp, name='nwm_coupling', value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  if (isPresent .and. isSet) then
+     if (trim(cvalue)=='true' .or. trim(cvalue)=='.true.' .or. trim(cvalue)=='T' .or. trim(cvalue)=='TRUE') then
+        keep_river_field = .true.
+     end if
+  end if
+  write(message, '(A,L1)') trim(compName)//' nwm_coupling (keep river_volume_flux) = ', keep_river_field
+  call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+#endif
+
   ! init schism
   call schism_init(0, './', iths, ntime)
   write(message, '(A)') trim(compName)//' initialized science model'
@@ -508,6 +550,16 @@ subroutine InitializeAdvertise(comp, importState, exportState, clock, rc)
   call NUOPC_Advertise(importState, "eastward_wave_radiation_stress", rc=localrc)
   call NUOPC_Advertise(importState, "eastward_northward_wave_radiation_stress", rc=localrc)
   call NUOPC_Advertise(importState, "northward_wave_radiation_stress", rc=localrc)
+
+#ifdef USE_NUOPC_RIVER
+  ! for one-way NWM river forcing (from the dnwm CDEPS component): volumetric
+  ! discharge [m3 s-1] per source element. Not a CF/standard field, so register
+  ! it in the dictionary first (same helper used for the mesh fields below).
+  call NUOPC_FieldDictionaryAddIfNeeded("river_volume_flux", "m3 s-1", localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  call NUOPC_Advertise(importState, "river_volume_flux", rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+#endif
 
   !> The mesh information is usually not in CF standard and therefore needs
   !> to be added to the FieldDictionary before advertising
@@ -796,6 +848,25 @@ subroutine InitializeRealize(comp, importState, exportState, clock, rc)
     name="northward_wave_radiation_stress", field=field, rc=localrc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
 
+#ifdef USE_NUOPC_RIVER
+  ! USE_NUOPC_RIVER injects discharge at element-based sources, so the river field
+  ! MUST be realized on the element mesh (then farrayPtr1 is indexed by local elem
+  ! ie). SCHISM_StateFieldCreateRealize uses the component-wide meshloc, so fail
+  ! loudly here if it is not element-based rather than silently mis-indexing.
+  if (meshloc /= ESMF_MESHLOC_ELEMENT) then
+    call ESMF_LogWrite('USE_NUOPC_RIVER requires the OCN (SCHISM) component meshloc=element', &
+      ESMF_LOGMSG_ERROR)
+    localrc = ESMF_RC_NOT_VALID
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  end if
+  ! Realize the river-discharge import on the element mesh. If no provider connects
+  ! it (e.g. the stub run with no NWM component), SCHISM_RemoveUnconnectedFields
+  ! drops it and SCHISM_ImportRiver falls back to the constant river_stub_q.
+  call SCHISM_StateFieldCreateRealize(comp, state=importState, &
+    name="river_volume_flux", field=field, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+#endif
+
   !> The list of export states is declared in InitializeAdvertise
   call ESMF_StateGet(exportState, itemCount=itemCount, rc=localrc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
@@ -1026,6 +1097,14 @@ subroutine ModelAdvance(comp, rc)
   call SCHISM_Import(comp, importState, clock, rc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
 
+#ifdef USE_NUOPC_RIVER
+  !> One-way NWM river forcing: fill SCHISM's volume-source buffer (ath3) before
+  !> the SCHISM timestep loop below. (SCHISM_Import runs before schism_step, so
+  !> ath3's new time level is in place when schism_step interpolates it.)
+  call SCHISM_ImportRiver(comp, importState, rc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+#endif
+
   !> Write log about advance
   call ESMF_ClockPrint(clock, options="currTime", &
       preString="--- advancing schism from ", unit=message, rc=localrc)
@@ -1095,6 +1174,19 @@ subroutine SCHISM_RemoveUnconnectedFields(state, rc)
   do i=1, itemCount
 
     if (itemTypeList(i) /= ESMF_STATEITEM_FIELD) cycle
+
+#ifdef USE_NUOPC_RIVER
+    ! Exempt the river import from removal when an NWM provider is configured
+    ! (nwm_coupling=true). This IPDv00 removal pass runs before the direct
+    ! NWM->OCN connector (CDEPS provider, transfer-based) has connected the
+    ! field; removing it here drops it permanently and ModelAdvance later aborts
+    ! with "no ESMF_Field found named: river_volume_flux".
+    if (keep_river_field .and. trim(itemNameList(i))=='river_volume_flux') then
+      write(message,'(A)') '--- keeping river_volume_flux (nwm_coupling=true); connection completes later'
+      call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+      cycle
+    end if
+#endif
 
     call ESMF_StateGet(state, trim(itemNameList(i)), field=field, rc=localrc)
     _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc_)
@@ -1531,6 +1623,106 @@ subroutine SCHISM_Import(comp, importState, clock, rc)
   call ESMF_LogWrite(trim(subname)//' done', ESMF_LOGMSG_INFO)
 
 end subroutine SCHISM_Import
+
+#ifdef USE_NUOPC_RIVER
+#undef ESMF_METHOD
+#define ESMF_METHOD "SCHISM_ImportRiver"
+!> @description One-way NWM river forcing. Fills SCHISM's volume-source buffer
+!> ath3 at the new time level (and the old level too, a zero-order hold) before
+!> the SCHISM timestep. ath3 is the full, rank-replicated source list (in the
+!> non-coupled path rank 0 reads it then broadcasts), so every rank fills it
+!> identically here; the per-rank element ownership is applied later inside
+!> schism_step via iegl(ieg_source(i)). Increment 1 injects a uniform constant
+!> stub discharge (river_stub_q), independent of CDEPS, to validate the SCHISM
+!> receiving side. Phase 5 will replace the constant with per-element discharge
+!> read from the connected 'river_volume_flux' import field.
+subroutine SCHISM_ImportRiver(comp, importState, rc)
+
+  use NUOPC,       only: NUOPC_IsConnected
+  use schism_glbl, only: nsources, ath3, if_source, ieg_source, iegl, ne
+  use schism_msgp, only: myrank
+
+  type(ESMF_GridComp)  :: comp
+  type(ESMF_State)     :: importState
+  integer, intent(out) :: rc
+
+  integer(ESMF_KIND_I4)           :: localrc
+  type(ESMF_Field)                :: field
+  type(ESMF_VM)                   :: vm
+  real(ESMF_KIND_R8), pointer     :: farrayPtr1(:) => null()
+  real(ESMF_KIND_R8), allocatable :: q_local(:), q_global(:)
+  integer                         :: i, ie
+  logical                         :: connected
+  type(ESMF_StateItem_Flag)       :: itemtype_river
+  character(len=ESMF_MAXSTR)      :: message
+
+  rc = ESMF_SUCCESS
+
+  ! USE_NUOPC_RIVER requires if_source=1 (sparse source_sink.in read in
+  ! schism_init). Nothing to do if sources are off or none were paired.
+  if (if_source == 0 .or. nsources <= 0) return
+
+  ! Is 'river_volume_flux' present in the import state AND connected to a provider?
+  ! On stub / no-NWM runs SCHISM_RemoveUnconnectedFields drops it, so query for
+  ! presence first (no error is logged for a missing item) and only then test the
+  ! connection. This makes a missing/unconnected field fall back cleanly to the
+  ! constant stub instead of aborting at ESMF_StateGet (the prior crash:
+  ! "no ESMF_Field found named: river_volume_flux").
+  connected = .false.
+  call ESMF_StateGet(importState, itemName="river_volume_flux", itemType=itemtype_river, rc=localrc)
+  if (localrc == ESMF_SUCCESS .and. itemtype_river == ESMF_STATEITEM_FIELD) then
+    call ESMF_StateGet(importState, itemName="river_volume_flux", field=field, rc=localrc)
+    if (localrc == ESMF_SUCCESS) then
+      connected = NUOPC_IsConnected(field, rc=localrc)
+      if (localrc /= ESMF_SUCCESS) connected = .false.
+    end if
+  end if
+
+  if (connected) then
+    ! Connected to a provider (the dnwm NWM data component). The field is realized
+    ! on the SCHISM element mesh, so farrayPtr1 is indexed by local OWNED element
+    ! ie (extent 1:ne). But SCHISM applies a source at BOTH the owner AND every
+    ! ghost copy of its element (iegl(g)%rank==myrank is true on all of them, with
+    ! the ghost head carrying %id>ne), and the apply loop requires ath3 to be
+    ! rank-REPLICATED (the standard path bcasts it). So each rank reads only the
+    ! sources it OWNS (%id<=ne => non-ghost, farrayPtr1 in bounds) into a source-
+    ! indexed buffer, then VMAllReduce(SUM) replicates the full source list to all
+    ! ranks (each source element is owned by exactly one rank, others contribute 0).
+    ! 'field' already retrieved above during the presence/connection check.
+    call ESMF_FieldGet(field, farrayPtr=farrayPtr1, rc=localrc)
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+    call ESMF_GridCompGet(comp, vm=vm, rc=localrc)
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+    allocate(q_local(nsources), q_global(nsources))
+    q_local = 0.0_ESMF_KIND_R8
+    do i = 1, nsources
+      if (iegl(ieg_source(i))%rank == myrank .and. iegl(ieg_source(i))%id <= ne) then
+        ie = iegl(ieg_source(i))%id
+        q_local(i) = max(0.0_ESMF_KIND_R8, farrayPtr1(ie))   ! owner reads its element [m^3/s]
+      end if
+    end do
+    call ESMF_VMAllReduce(vm, q_local, q_global, nsources, ESMF_REDUCE_SUM, rc=localrc)
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+    ath3(1:nsources,1,2,1) = real(q_global, 4)        ! new vsource, replicated on all ranks
+    ath3(1:nsources,1,1,1) = ath3(1:nsources,1,2,1)   ! zero-order hold (old=new)
+    write(message,'(A,I0,A,F0.3)') 'SCHISM_ImportRiver: CONNECTED to NWM provider; nsources=', &
+      nsources, ', vsource(1) [m^3/s] = ', ath3(1,1,2,1)
+    call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+    deallocate(q_local, q_global)
+  else
+    ! Unconnected (no NWM component, e.g. the stub run): inject a uniform constant
+    ! discharge into every (rank-replicated) source element. ath3(:,1,2,1) = new
+    ! vsource level [m^3/s]; old level set equal (zero-order hold) so schism_step's
+    ! interpolation yields the constant and the ath3>=0 sign check passes.
+    ath3(1:nsources,1,2,1) = real(max(0.0_ESMF_KIND_R8, river_stub_q), 4)
+    ath3(1:nsources,1,1,1) = ath3(1:nsources,1,2,1)
+    write(message,'(A,F0.3)') 'SCHISM_ImportRiver: STUB fallback (field absent/unconnected); '// &
+      'vsource [m^3/s] = ', real(max(0.0_ESMF_KIND_R8, river_stub_q), 4)
+    call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+  end if
+
+end subroutine SCHISM_ImportRiver
+#endif /*USE_NUOPC_RIVER*/
 
 #undef ESMF_METHOD
 #define ESMF_METHOD "SCHISM_StateWriteVTK"
