@@ -37,6 +37,7 @@ module schism_nuopc_cap
     model_routine_SS           => SetServices, &
     model_label_DataInitialize => label_DataInitialize, &
     model_label_SetClock       => label_SetClock, &
+    model_label_CheckImport    => label_CheckImport, &
     model_label_Advance        => label_Advance
 
 
@@ -116,6 +117,19 @@ subroutine SetServices(comp, rc)
   call NUOPC_CompSpecialize(comp, specLabel=model_label_Advance, &
     specRoutine=ModelAdvance, rc=localrc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+
+#ifdef USE_NUOPC_RIVER
+  ! Override the default run-phase import time check. The direct NWM->OCN
+  ! connector delivers river_volume_flux from the dnwm data component, whose
+  ! export timestamp need not equal SCHISM's currTime (no CMEPS mediator to
+  ! broker time). The default CheckImport aborts on that mismatch ("Import
+  ! Fields not at current time"). For one-way river forcing the exact stamp is
+  ! immaterial -- SCHISM_ImportRiver applies a zero-order hold of whatever value
+  ! is present -- so accept the import unconditionally.
+  call NUOPC_CompSpecialize(comp, specLabel=model_label_CheckImport, &
+    specRoutine=CheckImportRiver, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+#endif
 
   !> Do we need a specialization of Finalize, by adding a label?
   !call NUOPC_CompSpecialize(comp, specLabel=model_label_Finalize, &
@@ -865,6 +879,10 @@ subroutine InitializeRealize(comp, importState, exportState, clock, rc)
   call SCHISM_StateFieldCreateRealize(comp, state=importState, &
     name="river_volume_flux", field=field, rc=localrc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  ! NOTE: the run-phase "Import Fields not at current time" incompatibility on the
+  ! direct NWM->OCN connector is handled on the PROVIDER side: the dnwm cap stamps
+  ! its export with the component clock (NUOPC_SetTimestamp in dnwm ModelAdvance),
+  ! which the connector copies to this import field. No import-side toggle needed.
 #endif
 
   !> The list of export states is declared in InitializeAdvertise
@@ -1722,6 +1740,24 @@ subroutine SCHISM_ImportRiver(comp, importState, rc)
   end if
 
 end subroutine SCHISM_ImportRiver
+
+#undef ESMF_METHOD
+#define ESMF_METHOD "CheckImportRiver"
+!> @description Run-phase import-check specialization for USE_NUOPC_RIVER. Replaces
+!> the NUOPC default (which requires every connected import field to carry a
+!> timestamp equal to the component's current time). The dnwm river provider on
+!> the direct NWM->OCN connector does not time-broker through a mediator, so its
+!> river_volume_flux stamp can differ from SCHISM's currTime; the default check
+!> aborts the run. One-way river forcing tolerates this (zero-order hold), so this
+!> routine accepts the import unconditionally and returns success.
+subroutine CheckImportRiver(comp, rc)
+  type(ESMF_GridComp)  :: comp
+  integer, intent(out) :: rc
+
+  rc = ESMF_SUCCESS
+  ! Intentionally a no-op: do not enforce import-field timestamp consistency.
+  ! SCHISM_ImportRiver (called from ModelAdvance) reads whatever value is present.
+end subroutine CheckImportRiver
 #endif /*USE_NUOPC_RIVER*/
 
 #undef ESMF_METHOD
