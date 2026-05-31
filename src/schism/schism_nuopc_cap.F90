@@ -63,8 +63,15 @@ module schism_nuopc_cap
   !> a CDEPS provider that completes its connection in a later transfer phase —
   !> has connected the field. Removing it there drops it permanently. Keeping it
   !> lets the connection complete so ModelAdvance reads real per-element discharge.
-  !> Left .false. for stub / no-NWM runs so they remain byte-identical to before.
+  !> Left .false. for stub / no-NWM runs, where the river field is removed exactly
+  !> as in a non-river build.
   logical, save :: keep_river_field = .false.
+  !> Explicit opt-in to the constant-discharge STUB, set from the 'river_stub'
+  !> component attribute (default .false.). When river_volume_flux is
+  !> absent/unconnected, the cap substitutes river_stub_q ONLY if this is .true.;
+  !> otherwise it ABORTS rather than silently fabricating river inflow. This makes
+  !> the synthetic-flow path an explicit choice, never a silent fallback.
+  logical, save :: river_stub_mode = .false.
 #endif
 
 contains
@@ -125,7 +132,9 @@ subroutine SetServices(comp, rc)
   ! broker time). The default CheckImport aborts on that mismatch ("Import
   ! Fields not at current time"). For one-way river forcing the exact stamp is
   ! immaterial -- SCHISM_ImportRiver applies a zero-order hold of whatever value
-  ! is present -- so accept the import unconditionally.
+  ! is present. CheckImportRiver re-implements the default check but EXEMPTS ONLY
+  ! river_volume_flux; every other import (ATM/wave/ice) is still required to be
+  ! at the current time, so genuine staleness elsewhere still aborts the run.
   call NUOPC_CompSpecialize(comp, specLabel=model_label_CheckImport, &
     specRoutine=CheckImportRiver, rc=localrc)
   _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
@@ -394,6 +403,20 @@ subroutine InitializeAdvertise(comp, importState, exportState, clock, rc)
      end if
   end if
   write(message, '(A,L1)') trim(compName)//' nwm_coupling (keep river_volume_flux) = ', keep_river_field
+  call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+
+  ! river_stub=true: explicitly run the constant-discharge stub (river_stub_q) with
+  ! NO NWM provider. Required for standalone SCHISM-side validation. Without it, an
+  ! absent/unconnected river field is a configuration error (abort) rather than a
+  ! silent fabricated discharge (see SCHISM_ImportRiver).
+  call NUOPC_CompAttributeGet(comp, name='river_stub', value=cvalue, isPresent=isPresent, isSet=isSet, rc=rc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  if (isPresent .and. isSet) then
+     if (trim(cvalue)=='true' .or. trim(cvalue)=='.true.' .or. trim(cvalue)=='T' .or. trim(cvalue)=='TRUE') then
+        river_stub_mode = .true.
+     end if
+  end if
+  write(message, '(A,L1)') trim(compName)//' river_stub (explicit stub mode) = ', river_stub_mode
   call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
 #endif
 
@@ -1657,7 +1680,7 @@ end subroutine SCHISM_Import
 subroutine SCHISM_ImportRiver(comp, importState, rc)
 
   use NUOPC,       only: NUOPC_IsConnected
-  use schism_glbl, only: nsources, ath3, if_source, ieg_source, iegl, ne
+  use schism_glbl, only: nsources, nsinks, ath3, if_source, ieg_source, iegl, ne
   use schism_msgp, only: myrank
 
   type(ESMF_GridComp)  :: comp
@@ -1680,12 +1703,26 @@ subroutine SCHISM_ImportRiver(comp, importState, rc)
   ! schism_init). Nothing to do if sources are off or none were paired.
   if (if_source == 0 .or. nsources <= 0) return
 
+  ! Sinks are NOT supported by the one-way NWM prototype: this cap fills only the
+  ! volume-source buffer (vsource, via ath3); vsink is never populated, and the
+  ! init path leaves sinks at 0. A sink listed in source_sink.in would therefore be
+  ! silently ignored (zero withdrawal). Fail loudly instead of injecting only half
+  ! the requested exchange.
+  if (nsinks > 0) then
+    write(message,'(A,I0,A)') 'SCHISM_ImportRiver: nsinks=', nsinks, &
+      ' but sinks (vsink) are NOT supported by USE_NUOPC_RIVER; '// &
+      'use a source-only source_sink.in (nsinks=0).'
+    call ESMF_LogSetError(ESMF_RC_NOT_VALID, msg=trim(message), ESMF_CONTEXT, rcToReturn=rc)
+    return
+  end if
+
   ! Is 'river_volume_flux' present in the import state AND connected to a provider?
   ! On stub / no-NWM runs SCHISM_RemoveUnconnectedFields drops it, so query for
   ! presence first (no error is logged for a missing item) and only then test the
-  ! connection. This makes a missing/unconnected field fall back cleanly to the
-  ! constant stub instead of aborting at ESMF_StateGet (the prior crash:
-  ! "no ESMF_Field found named: river_volume_flux").
+  ! connection. Querying presence first avoids aborting at ESMF_StateGet (the prior
+  ! crash: "no ESMF_Field found named: river_volume_flux") and lets an
+  ! absent/unconnected field be handled by the explicit mode decision below (stub
+  ! only when river_stub=true; otherwise abort -- never a silent fabricated flow).
   connected = .false.
   call ESMF_StateGet(importState, itemName="river_volume_flux", itemType=itemtype_river, rc=localrc)
   if (localrc == ESMF_SUCCESS .and. itemtype_river == ESMF_STATEITEM_FIELD) then
@@ -1727,36 +1764,112 @@ subroutine SCHISM_ImportRiver(comp, importState, rc)
       nsources, ', vsource(1) [m^3/s] = ', ath3(1,1,2,1)
     call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
     deallocate(q_local, q_global)
-  else
-    ! Unconnected (no NWM component, e.g. the stub run): inject a uniform constant
-    ! discharge into every (rank-replicated) source element. ath3(:,1,2,1) = new
-    ! vsource level [m^3/s]; old level set equal (zero-order hold) so schism_step's
-    ! interpolation yields the constant and the ath3>=0 sign check passes.
+  else if (keep_river_field) then
+    ! nwm_coupling=true means a real NWM provider was expected on the direct
+    ! NWM->OCN connector, but river_volume_flux is absent/unconnected here: the
+    ! provider is not wired (missing NWM in the run sequence / EARTH component
+    ! list, or a field-name / connector mismatch). Refuse to silently substitute a
+    ! fabricated discharge -- abort so the misconfiguration is visible.
+    write(message,'(A)') 'SCHISM_ImportRiver: nwm_coupling=true but river_volume_flux '// &
+      'is absent/unconnected -- NWM provider not wired. Refusing to fabricate flow. '// &
+      'Wire the NWM component+connector, or set river_stub=true for the constant stub.'
+    call ESMF_LogSetError(ESMF_RC_NOT_VALID, msg=trim(message), ESMF_CONTEXT, rcToReturn=rc)
+    return
+  else if (river_stub_mode) then
+    ! Explicit stub mode (river_stub=true, no NWM provider): inject a uniform
+    ! constant discharge into every (rank-replicated) source element. ath3(:,1,2,1)
+    ! = new vsource level [m^3/s]; old level set equal (zero-order hold) so
+    ! schism_step's interpolation yields the constant and the ath3>=0 check passes.
     ath3(1:nsources,1,2,1) = real(max(0.0_ESMF_KIND_R8, river_stub_q), 4)
     ath3(1:nsources,1,1,1) = ath3(1:nsources,1,2,1)
-    write(message,'(A,F0.3)') 'SCHISM_ImportRiver: STUB fallback (field absent/unconnected); '// &
+    write(message,'(A,F0.3)') 'SCHISM_ImportRiver: STUB MODE (river_stub=true, no NWM provider); '// &
       'vsource [m^3/s] = ', real(max(0.0_ESMF_KIND_R8, river_stub_q), 4)
     call ESMF_LogWrite(trim(message), ESMF_LOGMSG_INFO)
+  else
+    ! USE_NUOPC_RIVER is active with sources, but neither a provider (nwm_coupling)
+    ! nor the explicit stub (river_stub) was selected. Ambiguous -- abort rather
+    ! than guess. (Previously this branch silently fabricated river_stub_q.)
+    write(message,'(A)') 'SCHISM_ImportRiver: river_volume_flux absent/unconnected and '// &
+      'no mode selected. Set nwm_coupling=true (connect an NWM provider) or '// &
+      'river_stub=true (constant river_stub_q stub).'
+    call ESMF_LogSetError(ESMF_RC_NOT_VALID, msg=trim(message), ESMF_CONTEXT, rcToReturn=rc)
+    return
   end if
 
 end subroutine SCHISM_ImportRiver
 
 #undef ESMF_METHOD
 #define ESMF_METHOD "CheckImportRiver"
-!> @description Run-phase import-check specialization for USE_NUOPC_RIVER. Replaces
-!> the NUOPC default (which requires every connected import field to carry a
-!> timestamp equal to the component's current time). The dnwm river provider on
+!> @description Run-phase import-check specialization for USE_NUOPC_RIVER. The
+!> NUOPC default requires EVERY connected import field to carry a timestamp equal
+!> to the component's current time, aborting otherwise. The dnwm river provider on
 !> the direct NWM->OCN connector does not time-broker through a mediator, so its
-!> river_volume_flux stamp can differ from SCHISM's currTime; the default check
-!> aborts the run. One-way river forcing tolerates this (zero-order hold), so this
-!> routine accepts the import unconditionally and returns success.
+!> river_volume_flux stamp can legitimately differ from SCHISM's currTime; one-way
+!> river forcing tolerates that (SCHISM_ImportRiver applies a zero-order hold).
+!> This routine therefore re-implements the default staleness check but EXEMPTS
+!> ONLY river_volume_flux: all other imports (ATM winds/pressure, wave, ice) must
+!> still be at the current time, exactly as the default enforced. A stale value on
+!> any of those is a real coupling error and aborts the run.
 subroutine CheckImportRiver(comp, rc)
+
+  use NUOPC,       only: NUOPC_IsAtTime, NUOPC_IsConnected
+  use NUOPC_Model, only: NUOPC_ModelGet
+
   type(ESMF_GridComp)  :: comp
   integer, intent(out) :: rc
 
+  integer(ESMF_KIND_I4)                   :: localrc
+  type(ESMF_Clock)                        :: clock
+  type(ESMF_Time)                         :: currTime
+  type(ESMF_State)                        :: importState
+  type(ESMF_Field)                        :: field
+  type(ESMF_StateItem_Flag), allocatable  :: itemTypeList(:)
+  character(len=ESMF_MAXSTR), allocatable :: itemNameList(:)
+  integer(ESMF_KIND_I4)                   :: i, itemCount
+  logical                                 :: connected, atTime
+  character(len=ESMF_MAXSTR)              :: message
+
   rc = ESMF_SUCCESS
-  ! Intentionally a no-op: do not enforce import-field timestamp consistency.
-  ! SCHISM_ImportRiver (called from ModelAdvance) reads whatever value is present.
+
+  call NUOPC_ModelGet(comp, modelClock=clock, importState=importState, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  call ESMF_ClockGet(clock, currTime=currTime, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+
+  call ESMF_StateGet(importState, itemCount=itemCount, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+  if (itemCount <= 0) return
+
+  allocate(itemTypeList(itemCount), itemNameList(itemCount))
+  call ESMF_StateGet(importState, itemTypeList=itemTypeList, &
+    itemNameList=itemNameList, rc=localrc)
+  _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+
+  do i = 1, itemCount
+    if (itemTypeList(i) /= ESMF_STATEITEM_FIELD) cycle
+    ! The river field is the ONLY exemption (direct connector, no mediator time).
+    if (trim(itemNameList(i)) == 'river_volume_flux') cycle
+    call ESMF_StateGet(importState, trim(itemNameList(i)), field=field, rc=localrc)
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+    connected = NUOPC_IsConnected(field, rc=localrc)
+    if (localrc /= ESMF_SUCCESS) then
+      localrc = ESMF_SUCCESS   ! treat an indeterminate connection state as unconnected
+      cycle
+    end if
+    if (.not. connected) cycle
+    atTime = NUOPC_IsAtTime(field, currTime, rc=localrc)
+    _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+    if (.not. atTime) then
+      write(message,'(A)') 'CheckImportRiver: import field "'//trim(itemNameList(i))// &
+        '" is NOT at the current time (stale coupling input)'
+      call ESMF_LogSetError(ESMF_RC_VAL_WRONG, msg=trim(message), ESMF_CONTEXT, rcToReturn=rc)
+      deallocate(itemTypeList, itemNameList)
+      return
+    end if
+  end do
+
+  deallocate(itemTypeList, itemNameList)
+
 end subroutine CheckImportRiver
 #endif /*USE_NUOPC_RIVER*/
 

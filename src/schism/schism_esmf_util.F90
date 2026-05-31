@@ -1631,7 +1631,11 @@ subroutine SCHISM_MeshCreateElement(comp, kwe, rc)
      call ESMF_FieldGet(field, farrayPtr=farrayPtrI41, rc=localrc)
      _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc_)
 
-     farrayPtrI41 = elementIds(1:nea)
+     ! mesh2d here is the OWNED-only element mesh (elementids and elementDistgrid
+     ! are sized ne and filled do ie=1,ne), so this field has ne local elements.
+     ! Read 1:ne, not 1:nea: elementIds is allocated to ne and reading 1:nea
+     ! (nea>ne, includes ghosts) overruns the array and mismatches the LHS shape.
+     farrayPtrI41 = elementIds(1:ne)
 
      call ESMF_StateAddReplace(exportstate, (/field/), rc=localrc)
      _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc_)
@@ -1652,7 +1656,10 @@ subroutine SCHISM_MeshCreateElement(comp, kwe, rc)
      call ESMF_FieldGet(field, farrayPtr=farrayPtrI42, rc=localrc)
      _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc_)
 
-     do ie = 1, nea
+     ! ne (owned) elements only: farrayPtrI42 is sized to this mesh's ne local
+     ! elements, so looping to nea would write past its first-dimension bound
+     ! (ghost elements ne+1:nea are not part of the owned-only mesh built above).
+     do ie = 1, ne
        do ii = 1, i34(ie)
          farrayPtrI42(ie,ii) = iplg(elnode(ii,ie))
        end do
