@@ -72,6 +72,20 @@ module schism_nuopc_cap
   !> otherwise it ABORTS rather than silently fabricating river inflow. This makes
   !> the synthetic-flow path an explicit choice, never a silent fallback.
   logical, save :: river_stub_mode = .false.
+  !> Frozen-provider tripwire state for the connected river field. CheckImportRiver
+  !> deliberately EXEMPTS river_volume_flux from the at-currTime staleness abort
+  !> (the direct NWM->OCN connector is not mediator-time-brokered and a zero-order
+  !> hold is intended), but a connected provider that stops updating would then feed
+  !> SCHISM an ever-staler discharge unnoticed. CheckRiverProviderAdvancing records
+  !> the field's NUOPC "TimeStamp" across coupling windows and warns if it stops
+  !> advancing while the model clock advances. State persists across the run.
+  logical, save :: river_stamp_seen = .false.
+  integer(ESMF_KIND_I4), allocatable, save :: river_prev_stamp(:)
+  type(ESMF_Time), save :: river_prev_time
+  integer, save :: river_stall_count = 0
+  !> Consecutive non-advancing windows tolerated before warning (small cushion so a
+  !> one-off phase hiccup is ignored; a genuinely frozen provider still trips it).
+  integer, parameter :: RIVER_STALL_LIMIT = 2
 #endif
 
 contains
@@ -1847,8 +1861,22 @@ subroutine CheckImportRiver(comp, rc)
 
   do i = 1, itemCount
     if (itemTypeList(i) /= ESMF_STATEITEM_FIELD) cycle
-    ! The river field is the ONLY exemption (direct connector, no mediator time).
-    if (trim(itemNameList(i)) == 'river_volume_flux') cycle
+    ! The river field is the ONLY exemption from the at-currTime abort (direct
+    ! connector, no mediator time-brokering; SCHISM_ImportRiver applies a zero-order
+    ! hold). But a connected provider that silently stops advancing must still be
+    ! caught, so track its timestamp here instead of blindly skipping the field.
+    if (trim(itemNameList(i)) == 'river_volume_flux') then
+      call ESMF_StateGet(importState, trim(itemNameList(i)), field=field, rc=localrc)
+      _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+      connected = NUOPC_IsConnected(field, rc=localrc)
+      if (localrc /= ESMF_SUCCESS) then
+        localrc = ESMF_SUCCESS   ! indeterminate connection -> stub path, nothing to track
+      else if (connected) then
+        call CheckRiverProviderAdvancing(field, currTime, rc=localrc)
+        _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
+      end if
+      cycle
+    end if
     call ESMF_StateGet(importState, trim(itemNameList(i)), field=field, rc=localrc)
     _SCHISM_LOG_AND_FINALIZE_ON_ERROR_(rc)
     connected = NUOPC_IsConnected(field, rc=localrc)
@@ -1871,6 +1899,80 @@ subroutine CheckImportRiver(comp, rc)
   deallocate(itemTypeList, itemNameList)
 
 end subroutine CheckImportRiver
+
+#undef ESMF_METHOD
+#define ESMF_METHOD "CheckRiverProviderAdvancing"
+!> @description Frozen-NWM-provider tripwire. river_volume_flux is exempt from the
+!> at-currTime staleness abort (see CheckImportRiver), so a connected provider that
+!> stops updating would feed SCHISM an ever-staler discharge with no error. This
+!> routine reads the field's NUOPC "TimeStamp" attribute -- the same stamp the dnwm
+!> ModelAdvance sets each window and that NUOPC_IsAtTime compares -- and compares it
+!> to the previous window's. If the model clock advanced but the river stamp did not
+!> for more than RIVER_STALL_LIMIT consecutive windows, it logs a WARNING. It never
+!> aborts: a legitimately coarser river cadence must still be tolerated, and if the
+!> "TimeStamp" attribute is unavailable it degrades to the previous accept behavior.
+subroutine CheckRiverProviderAdvancing(field, currTime, rc)
+
+  type(ESMF_Field), intent(in)  :: field
+  type(ESMF_Time),  intent(in)  :: currTime
+  integer,          intent(out) :: rc
+
+  integer(ESMF_KIND_I4)              :: localrc
+  integer(ESMF_KIND_I4)              :: stampCount
+  integer(ESMF_KIND_I4), allocatable :: stamp(:)
+  logical                            :: timeAdvanced, stampAdvanced
+  character(len=ESMF_MAXSTR)         :: message
+
+  rc = ESMF_SUCCESS
+
+  ! Number of integers in the NUOPC timestamp attribute (yy,mm,dd,h,m,s,...).
+  call ESMF_AttributeGet(field, name="TimeStamp", convention="NUOPC", &
+    purpose="Instance", itemCount=stampCount, rc=localrc)
+  if (localrc /= ESMF_SUCCESS .or. stampCount <= 0) return   ! not stampable -> skip
+  allocate(stamp(stampCount))
+  call ESMF_AttributeGet(field, name="TimeStamp", convention="NUOPC", &
+    purpose="Instance", valueList=stamp, rc=localrc)
+  if (localrc /= ESMF_SUCCESS) then
+    deallocate(stamp)
+    return
+  end if
+
+  if (river_stamp_seen) then
+    timeAdvanced = (currTime > river_prev_time)
+    if (allocated(river_prev_stamp)) then
+      if (size(river_prev_stamp) == size(stamp)) then
+        stampAdvanced = any(stamp /= river_prev_stamp)
+      else
+        stampAdvanced = .true.   ! shape changed -- cannot compare, assume advanced
+      end if
+    else
+      stampAdvanced = .true.
+    end if
+    if (timeAdvanced .and. .not. stampAdvanced) then
+      river_stall_count = river_stall_count + 1
+      if (river_stall_count >= RIVER_STALL_LIMIT) then
+        write(message,'(A,I0,A)') &
+          'CheckImportRiver: river_volume_flux timestamp has not advanced for ', &
+          river_stall_count, &
+          ' coupling window(s) while the clock did -- SCHISM is holding a frozen '// &
+          'NWM discharge; verify the dnwm provider/stream.'
+        call ESMF_LogWrite(trim(message), ESMF_LOGMSG_WARNING)
+      end if
+    else
+      river_stall_count = 0
+    end if
+  end if
+
+  ! record this window's observation for the next comparison
+  if (allocated(river_prev_stamp)) deallocate(river_prev_stamp)
+  allocate(river_prev_stamp(size(stamp)))
+  river_prev_stamp = stamp
+  river_prev_time  = currTime
+  river_stamp_seen = .true.
+
+  deallocate(stamp)
+
+end subroutine CheckRiverProviderAdvancing
 #endif /*USE_NUOPC_RIVER*/
 
 #undef ESMF_METHOD
